@@ -1,0 +1,26 @@
+# docker-compose.ext.yml — run meeting-api under the out-of-tree extension.
+#
+# The image already sets PYTHONPATH=/app/src, so mounting the package into /app/src/vexa_ext makes it
+# importable with NO rebuild. Only the container's command changes; every other service is untouched.
+#
+# Layer it LAST, on the same project:
+#   docker compose -p vexa \
+#     -f deploy/compose/docker-compose.yml \
+#     -f ext/compose/docker-compose.ext.yml \
+#     up -d --no-build --no-deps meeting-api
+#
+# Strategy:
+#   VEXA_EXT_STRATEGY=postwrap  (default) — upstream's composition root + our routes. No port swap.
+#   VEXA_EXT_STRATEGY=root                — our composition root. Required for the tenant stamp.
+#
+# For a real deployment, bake the package into an image layer instead of bind-mounting it (a
+# read-only host mount is a dev-loop convenience, not a production artifact).
+services:
+  meeting-api:
+    volumes:
+      - ../../ext/vexa_ext:/app/src/vexa_ext:ro
+    environment:
+      - VEXA_EXT_STRATEGY=${VEXA_EXT_STRATEGY:-postwrap}
+      - VEXA_EXT_DEFAULT_TENANT=${VEXA_EXT_DEFAULT_TENANT:-unassigned}
+      - VEXA_EXT_TENANT_MAP=${VEXA_EXT_TENANT_MAP:-}
+    command: ["python", "-m", "vexa_ext"]
