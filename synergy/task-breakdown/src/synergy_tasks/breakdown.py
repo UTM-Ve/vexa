@@ -1,28 +1,18 @@
-"""tasks.py — the TASK BREAKDOWN stage: the LOGIC (its runner is ``worker.tasks_stage``).
-
-A stage that runs AFTER the cleaned transcript: given the meeting's processed notes (the 1:1 cleaned
-lines the copilot already produced), it breaks the conversation down into discrete tasks, each with
-an OWNER and a DUE DATE.
-
-    transcript.v1  →  cleaned notes (processed-notes.v1)  →  **task breakdown**
+"""breakdown.py — the LOGIC of the stage: transcript in, tasks out. Pure, offline-provable.
 
 Three things are separated on purpose:
 
-- **Breakdown + owner naming + the due PHRASE** come from ONE direct ``CompletionPort`` call (a
-  pure prompt→text turn, like a card beat — no harness, no subprocess, no workspace memory). The
-  frame here is the MECHANISM; ``task_rules`` (governed in ``agents/tasks.md``) is the POLICY.
+- **Breakdown + owner naming + the due PHRASE** come from ONE model call. The frame here is the
+  MECHANISM; ``task_rules`` (governed in the workspace's ``agents/tasks.md``) is the POLICY.
 - **Owner resolution** (``resolve_owner``) is deterministic code: the model names a person, this
   module binds that name to a meeting speaker, keeps a named non-speaker as a mention, and refuses
   to guess for a pronoun ("we", "someone") — that lands as ``unassigned``.
-- **Due-date normalization** (``normalize_due``) is deterministic code too: the model reports the
+- **Due-date resolution** (``normalize_due``) is deterministic code too: the model reports the
   phrase it heard ("by Friday", "in two weeks"), and this module resolves it against the meeting's
-  own date. An LLM doing calendar arithmetic is exactly where a silently wrong date comes from.
+  own date. A model doing calendar arithmetic is exactly where a silently wrong date comes from.
 
 A task carries ``due_text`` (the phrase, verbatim) alongside ``due`` (the resolved ISO date, or
 ``None``): an unresolvable phrase is reported as heard, never invented.
-
-This module is SELF-CONTAINED — it reads no other worker module's internals — so the stage is a
-strictly additive extension of the pipeline rather than a rewrite of any part of it.
 """
 from __future__ import annotations
 
@@ -33,22 +23,15 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
-from typing import Iterator
+from typing import Optional
 
-from llm import (
-    LLMAuthError,
-    auth_error_event,
-    completion_from_env,
-    looks_like_auth_failure,
-    model_error_event,
-)
+from synergy_tasks.completion import CompletionPort, completion_from_env
 
-log = logging.getLogger("agent_api.worker")
+log = logging.getLogger("synergy_tasks")
 
-# The DEFAULT breakdown POLICY. It lives here as the code fallback; the user GOVERNS it by editing
-# ``agents/tasks.md`` in their workspace (same prompt-only governance the copilot's polish/tag rules
-# use) — changing the file changes the prompt, no redeploy.
+# The DEFAULT breakdown POLICY. It lives here as the code fallback; a workspace GOVERNS it by
+# carrying ``agents/tasks.md`` (see ../../templates/tasks.md) — changing that file changes the
+# prompt, no redeploy.
 DEFAULT_TASK_RULES = (
     "Extract only COMMITMENTS that were actually made in this meeting — something a named person "
     "said they would do, or that the group agreed must be done. One task per deliverable: split a "
@@ -59,7 +42,7 @@ DEFAULT_TASK_RULES = (
     "commitments that the meeting explicitly dropped."
 )
 
-# The states task.v1 defines; a freshly extracted task is always `open`.
+# The states a task can be in; a freshly extracted task is always `open`.
 TASK_STATE_OPEN = "open"
 TASK_SOURCE_MEETING = "meeting"
 UNASSIGNED = "unassigned"
@@ -439,6 +422,7 @@ def parse_tasks(
 
 # ── the stage turn ────────────────────────────────────────────────────────────────────────────────
 
+
 # A long meeting is broken down in WINDOWS: one call per window of cleaned lines, tasks merged
 # across them. A whole-meeting prompt is the simple case (one window) and stays one call; an hour of
 # transcript stops depending on a provider route's context length. Override: ``VEXA_TASKS_WINDOW``.
@@ -453,24 +437,24 @@ def window_lines() -> int:
     return n if n >= 1 else DEFAULT_WINDOW_LINES
 
 
-def meeting_tasks_turn(
-    work: Path, notes: list[dict], *, meeting: str, meeting_date: str, model: str | None = None,
-    task_rules: str = DEFAULT_TASK_RULES, steering: str = "", completion=None,
-    window: int | None = None,
-) -> Iterator[dict]:
-    """The task-breakdown stage: one direct ``CompletionPort`` call per window of cleaned notes,
-    yielding one ``{"type": "task", "task": {...}}`` event per extracted task (owner + due resolved
-    in code, never by the model). Tasks are merged across windows and de-duped by (owner, title). A
-    meeting with no commitments yields nothing — a valid outcome, not a failure.
+def break_down_meeting(
+    notes: list[dict], *, meeting: str, meeting_date: str, model: Optional[str] = None,
+    task_rules: str = DEFAULT_TASK_RULES, steering: str = "",
+    completion: Optional[CompletionPort] = None, window: Optional[int] = None,
+) -> list[dict]:
+    """The stage: the meeting's cleaned notes in, its resolved tasks out (owner + due resolved in
+    code, never by the model). One model call per window of lines; results merged and de-duped by
+    (owner, title). A meeting with no commitments returns [] — a valid outcome, not a failure.
 
-    ``completion`` is injectable; by default it resolves through the ``worker.worker``
-    ``completion_factory`` seam (env-selected adapter, ``VEXA_LLM_PROVIDER``) — the same seam the
-    card beat uses."""
+    Raises ``CompletionError`` (or ``AuthError`` / ``ConfigError``) when the call itself fails —
+    the caller decides whether that costs the run or just this meeting."""
     spoken = [n for n in notes if str(n.get("text") or "").strip()]
     if not spoken:
-        return
+        return []
     size = window or window_lines()
     speakers = speakers_of(spoken)          # the WHOLE meeting's speakers, in every window
+    client = completion or completion_from_env()
+    tasks: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for start in range(0, len(spoken), size):
         chunk = spoken[start:start + size]
@@ -478,105 +462,12 @@ def meeting_tasks_turn(
             transcript_lines(chunk), speakers, date=meeting_date,
             task_rules=task_rules, steering=steering,
         )
-        try:
-            if completion is None:
-                import worker.worker as _w
-                completion = getattr(_w, "completion_factory", completion_from_env)()
-            reply = completion.complete(prompt, model=model).text
-        except LLMAuthError as exc:
-            yield auth_error_event(exc, model=model, stage="meeting-tasks")
-            return
-        except Exception as exc:  # noqa: BLE001 — a failed stage must report, never crash the meeting
-            if looks_like_auth_failure(exc):
-                yield auth_error_event(exc, model=model, stage="meeting-tasks")
-                return
-            yield model_error_event(exc, model=model, stage="meeting-tasks")
-            return
+        reply = client.complete(prompt, model=model).text
         for task in parse_tasks(reply, notes=chunk, meeting=meeting, meeting_date=meeting_date,
-                                 speakers=speakers):
+                                speakers=speakers):
             key = (task["owner"].casefold(), task["title"].casefold())
-            if key in seen:      # the same commitment restated in a later window — one task, not two
+            if key in seen:  # the same commitment restated in a later window — one task, not two
                 continue
             seen.add(key)
-            yield {"type": "task", "task": task}
-
-
-# ── the durable artifact: one workspace entity per task ───────────────────────────────────────────
-
-def render_task_entity(task: dict, meta: dict | None = None) -> str:
-    """Render one task as a ``kg/entities/task/<slug>.md`` workspace entity: YAML frontmatter (the
-    machine-readable owner/due/state) + the human-readable body. Pure + deterministic, so the write
-    is testable offline and byte-stable across re-runs."""
-    meta = meta or {}
-    fm = [
-        "type: task",
-        f"id: {task.get('id', '')}",
-        f"title: {json.dumps(str(task.get('title') or ''))}",
-        f"owner: {task.get('owner') or UNASSIGNED}",
-        f"owner_source: {task.get('owner_source') or UNASSIGNED}",
-        f"state: {task.get('state') or TASK_STATE_OPEN}",
-        f"due: {task.get('due') or ''}",
-        f"due_text: {json.dumps(str(task.get('due_text') or ''))}",
-        f"source: {task.get('source') or TASK_SOURCE_MEETING}",
-        f"meeting: {task.get('meeting') or meta.get('id') or ''}",
-    ]
-    if meta.get("date"):
-        fm.append(f"meeting_date: {meta['date']}")
-    parts = ["---", *fm, "---", "", f"# {task.get('title') or 'Task'}", ""]
-    detail = str(task.get("detail") or "").strip()
-    if detail:
-        parts += [detail, ""]
-    due = task.get("due")
-    due_text = str(task.get("due_text") or "").strip()
-    if due:
-        parts.append(f"- **Due:** {due}" + (f" _(heard as \"{due_text}\")_" if due_text else ""))
-    elif due_text:
-        parts.append(f"- **Due:** unresolved — heard as \"{due_text}\"")
-    else:
-        parts.append("- **Due:** none given")
-    parts.append(f"- **Owner:** {task.get('owner') or UNASSIGNED}"
-                 + (" _(named in the meeting, not a speaker)_" if task.get("owner_source") == "mention" else "")
-                 + (" _(nobody took this)_" if task.get("owner_source") == UNASSIGNED else ""))
-    native = task.get("meeting") or meta.get("id")
-    if native:
-        parts.append(f"- **From:** [[kg/entities/meeting/{native}]]")
-    evidence = [str(e) for e in (task.get("evidence") or [])]
-    if evidence:
-        parts += ["", "## Evidence", ""]
-        parts += [f"- transcript line `{e}`" for e in evidence]
-    return "\n".join(parts) + "\n"
-
-
-def task_file_path(root: Path, task: dict) -> Path:
-    """Where a task entity lives: ``<root>/<title-slug>.md``. When a DIFFERENT meeting already owns
-    that filename, the task's id digest disambiguates — two meetings that each said "send the deck"
-    stay two files, while re-running the SAME meeting keeps updating the one file (idempotent)."""
-    root = Path(root)
-    stem = slugify(task.get("title") or "task")
-    candidate = root / f"{stem}.md"
-    if candidate.exists():
-        existing = _frontmatter_value(candidate, "meeting")
-        if existing and existing != str(task.get("meeting") or ""):
-            return root / f"{stem}-{str(task.get('id') or '').rsplit('_', 1)[-1]}.md"
-    return candidate
-
-
-def _frontmatter_value(path: Path, key: str) -> str | None:
-    try:
-        for line in path.read_text().splitlines()[1:20]:
-            if line.strip() == "---":
-                break
-            if line.startswith(f"{key}:"):
-                return line.split(":", 1)[1].strip()
-    except OSError:
-        return None
-    return None
-
-
-def upsert_task_file(root: Path, task: dict, meta: dict | None = None) -> Path:
-    """Idempotently write one task entity under ``root``. Re-running the stage on the same meeting
-    rewrites the same file with the same bytes (the id is derived from meeting+title)."""
-    path = task_file_path(root, task)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_task_entity(task, meta))
-    return path
+            tasks.append(task)
+    return tasks
