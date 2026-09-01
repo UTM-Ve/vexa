@@ -513,6 +513,15 @@ def main() -> None:  # pragma: no cover — the container entrypoint (wired in t
                 "model": cfg.model or os.environ.get("VEXA_LLM_MODEL"),
             },
         )
+        # ── task breakdown (additive stage; worker.tasks_stage owns everything about it) ──────────
+        # serve_meeting has returned: the meeting is over and its cleaned stream is complete (the
+        # `view_end` marker is written). One guarded call — the stage reads that finished stream,
+        # breaks the meeting into tasks with owners + due dates, and writes them to the workspace.
+        # It gates itself (agents/tasks.md / VEXA_MEETING_TASKS) and never raises into this path.
+        from worker.tasks_stage import run_after_meeting
+
+        run_after_meeting(client, work=work, row_id=row_id, native=native,
+                          out_topic=out_topic, meeting_meta=meeting_meta)
     else:  # chat / routine / event — run the entrypoint, then serve interactive messages
         # Research-capable toolset: WEB search/fetch + the workspace tools. Writes are committed by
         # run_harness_turn. Override with VEXA_CHAT_TOOLS (comma-separated).
