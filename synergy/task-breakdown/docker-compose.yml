@@ -1,0 +1,32 @@
+# Synergy-only overlay: run the task-breakdown stage beside a Vexa compose deployment.
+#
+#   docker compose -f deploy/compose/docker-compose.yml -f synergy/task-breakdown/docker-compose.yml up -d
+#
+# It joins nothing but the workspaces volume — no Vexa service is modified, and removing this file
+# removes the feature.
+services:
+  synergy-task-breakdown:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # The model the breakdown runs on — the SAME variables the deployment already sets for the
+      # copilot; VEXA_TASKS_MODEL overrides just this stage.
+      - VEXA_LLM_PROVIDER=${VEXA_LLM_PROVIDER:-openai-compat}
+      - VEXA_LLM_BASE_URL=${VEXA_LLM_BASE_URL:-}
+      - VEXA_LLM_API_KEY=${VEXA_LLM_API_KEY:-}
+      - VEXA_LLM_MODEL=${VEXA_LLM_MODEL:-}
+      - VEXA_TASKS_MODEL=${VEXA_TASKS_MODEL:-}
+      # Stage knobs: off switch, sweep cadence, transcript per call, commit the writes.
+      - VEXA_MEETING_TASKS=${VEXA_MEETING_TASKS:-1}
+      - VEXA_TASKS_INTERVAL=${VEXA_TASKS_INTERVAL:-60}
+      - VEXA_TASKS_WINDOW=${VEXA_TASKS_WINDOW:-400}
+      - VEXA_TASKS_COMMIT=${VEXA_TASKS_COMMIT:-1}
+    volumes:
+      - agent-workspaces:/workspaces
+    restart: unless-stopped
+
+volumes:
+  agent-workspaces:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME:-vexa-v012}_agent-workspaces

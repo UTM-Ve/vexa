@@ -1,0 +1,19 @@
+[project]
+name = "synergy-task-breakdown"
+version = "0.1.0"
+description = "Synergy-only stage: a finished meeting's cleaned transcript -> tasks with an owner and a due date, written into the meeting's workspace."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27,<1",
+    "PyYAML>=6,<7",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.0.3"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
